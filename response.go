@@ -1,6 +1,8 @@
 package crawler
 
-import "crawler/htmlquery"
+import "github.com/qhzhyt/go-crawler/htmlquery"
+
+// import "htmlquery"
 
 // Response Crawler的响应
 type Response struct {
