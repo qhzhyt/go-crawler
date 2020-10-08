@@ -149,8 +149,8 @@ func (c *Crawler) WithDefaultCallback(callback func(res *Response, ctx *Context)
 	return c
 }
 
-// WithStartRequest 自定义request
-func (c *Crawler) WithStartRequest(callback func(ctx *Context) []*Request) *Crawler {
+// WithStartRequests 自定义request
+func (c *Crawler) WithStartRequests(callback func(ctx *Context) []*Request) *Crawler {
 	c.StartRequests = callback
 	return c
 }
