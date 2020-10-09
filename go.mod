@@ -1,4 +1,4 @@
-module github.com/qhzhyt/crawler-go
+module github.com/qhzhyt/go-crawler
 
 go 1.13
 
@@ -8,4 +8,4 @@ require (
 	golang.org/x/net v0.0.0-20201006153459-a7d1128ccaa0
 )
 
-// replace crawler => go-crawler
+replace github.com/qhzhyt/go-crawler => ./

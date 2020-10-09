@@ -3,55 +3,95 @@ package crawler
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sync/atomic"
 	"time"
 )
 
-// Context 爬虫执行上下文
-type Context struct {
-	visitedUrls         map[string]bool
-	Engine              *CrawlEngine
-	RequestQueue        chan *Request
-	ItemQueue           chan interface{}
-	Crawler             *Crawler
-	Settings            *Settings
-	RequestingCount     int32
-	ProcessingItemCount int32
-}
-
 // CrawlEngine 爬取引擎
 type CrawlEngine struct {
-	context    *Context
-	crawler    *Crawler
-	httpClient *http.Client
+	// context             *Context
+	crawler             *Crawler
+	cookieJar           *http.CookieJar
+	visitedUrls         map[string]bool
+	httpClient          *http.Client
+	RequestQueue        chan *Request
+	ItemQueue           chan *itemWrapper
+	RequestingCount     int32
+	ProcessingItemCount int32
+	Settings            *Settings
+	RequestMetaMap      map[*http.Request]Meta
+}
+
+type itemWrapper struct {
+	item    interface{}
+	context *Context
 }
 
 // Start 启动引擎
 func (eng *CrawlEngine) Start() {
-	go eng.StartProcessRequests(eng.context)
-	go eng.StartProcessItems(eng.context)
+	go eng.StartProcessRequests()
+	go eng.StartProcessItems()
+}
+
+func proxyFunc(eng *CrawlEngine) func(req *http.Request) (*url.URL, error) {
+
+	return func(req *http.Request) (*url.URL, error) {
+		meta := eng.RequestMetaMap[req]
+		proxy := meta["ProxyURL"]
+		if proxy != nil && proxy.(string) != "" {
+			return url.Parse(proxy.(string))
+		}
+		return nil, nil
+	}
+}
+
+func afterRequestFunc(eng *CrawlEngine) func(req *http.Request) {
+	return func(req *http.Request) {
+		fmt.Println(eng.RequestMetaMap)
+	}
+}
+
+// NewCrawlerEngine NewCrawlerEngine
+func newCrawlerEngine(settings *Settings) *CrawlEngine {
+	eng := &CrawlEngine{
+		Settings:       settings,
+		RequestQueue:   make(chan *Request, 100),
+		ItemQueue:      make(chan *itemWrapper, 100),
+		RequestMetaMap: make(map[*http.Request]Meta),
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{Proxy: proxyFunc(eng)},
+	}
+
+	eng.httpClient = httpClient
+
+	return eng
 }
 
 // StartProcessItems 开始处理Items
-func (eng *CrawlEngine) StartProcessItems(ctx *Context) {
+func (eng *CrawlEngine) StartProcessItems() {
 	workerCount := int32(6)
-	if ctx.Settings.MaxConcurrentProcessItems > 0 {
-		workerCount = ctx.Settings.MaxConcurrentProcessItems
+	if eng.Settings.MaxConcurrentProcessItems > 0 {
+		workerCount = eng.Settings.MaxConcurrentProcessItems
 	}
 
-	worker := func(ctx *Context) {
+	worker := func() {
 		hasInc := false
 		defer func() {
 			if hasInc {
-				atomic.AddInt32(&ctx.ProcessingItemCount, -1)
+				atomic.AddInt32(&eng.ProcessingItemCount, -1)
 			}
 		}()
 
-		for item := range ctx.ItemQueue {
-			atomic.AddInt32(&ctx.ProcessingItemCount, 1)
+		for itemW := range eng.ItemQueue {
+			item := itemW.item
+			ctx := itemW.context
+			atomic.AddInt32(&eng.ProcessingItemCount, 1)
 			hasInc = true
 
 			/* pipeline 执行顺序
@@ -60,10 +100,10 @@ func (eng *CrawlEngine) StartProcessItems(ctx *Context) {
 			** 3）若上步返回值非空继续按顺序执行pipeline列表中的pipeline
 			 */
 
-			if len(ctx.Crawler.ItemTypeFuncs) > 0 {
-				if len(ctx.Crawler.ItemTypeFuncs) > 1 || ctx.Crawler.ItemTypeFuncs["*"] == nil {
+			if item != nil && len(eng.crawler.ItemTypeFuncs) > 0 {
+				if len(eng.crawler.ItemTypeFuncs) > 1 || eng.crawler.ItemTypeFuncs["*"] == nil {
 					itemType := reflect.TypeOf(item).String()
-					if processFunc := ctx.Crawler.ItemTypeFuncs[itemType]; processFunc != nil {
+					if processFunc := eng.crawler.ItemTypeFuncs[itemType]; processFunc != nil {
 						item = processFunc(item, ctx)
 					}
 				}
@@ -81,24 +121,25 @@ func (eng *CrawlEngine) StartProcessItems(ctx *Context) {
 					}
 				}
 			}
-			atomic.AddInt32(&ctx.ProcessingItemCount, -1)
+			atomic.AddInt32(&eng.ProcessingItemCount, -1)
 			hasInc = false
 		}
 	}
 
 	for i := int32(0); i < workerCount; i++ {
-		go worker(eng.context)
+		go worker()
 	}
 }
 
 // StartProcessRequests 开始处理请求
-func (eng *CrawlEngine) StartProcessRequests(ctx *Context) {
+func (eng *CrawlEngine) StartProcessRequests() {
 	// request = http.Request{Method: "GET"}
 	// request.
-	fmt.Println(eng, ctx)
+	fmt.Println(eng)
 	worker := func(req *Request) {
-		atomic.AddInt32(&ctx.RequestingCount, 1)
-		defer atomic.AddInt32(&ctx.RequestingCount, -1)
+		ctx := req.context
+		atomic.AddInt32(&eng.RequestingCount, 1)
+		defer atomic.AddInt32(&eng.RequestingCount, -1)
 
 		timeout := time.Duration(20 * time.Microsecond)
 		if req.Timeout != 0 {
@@ -106,9 +147,15 @@ func (eng *CrawlEngine) StartProcessRequests(ctx *Context) {
 		}
 		_context, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		request, err := http.NewRequest(req.Method, req.URL, nil)
-		if err != nil {
-			fmt.Println(err)
+		request := req.toHTTPRequest()
+		// runtime.SetFinalizer(request, afterRequestFunc(eng))
+		if len(req.Meta) > 0 {
+			eng.RequestMetaMap[request] = req.Meta
+			defer delete(eng.RequestMetaMap, request)
+		}
+
+		if request == nil {
+			fmt.Println("request is nil")
 		}
 		request.WithContext(_context)
 
@@ -116,10 +163,15 @@ func (eng *CrawlEngine) StartProcessRequests(ctx *Context) {
 		if err != nil {
 			fmt.Println(err)
 		}
-		defer response.Body.Close()
-		body, _ := ioutil.ReadAll(response.Body)
+
+		if response == nil {
+			return
+		}
+
 		// response.Header
-		res := NewResponse(body).WithRequest(req).WithStatus(response.StatusCode, response.Status)
+		res := NewResponse(response).WithRequest(req)
+
+		ctx.LastResponse = res
 		// &Response{Body: body, Status: response.Status, StatusCode: response.StatusCode, Request: req}
 		if req.Callback != nil {
 			req.Callback(res, ctx)
@@ -127,16 +179,16 @@ func (eng *CrawlEngine) StartProcessRequests(ctx *Context) {
 			eng.crawler.RequestCallback(res, ctx)
 		}
 	}
-	for req := range ctx.RequestQueue {
+	for req := range eng.RequestQueue {
 		fmt.Println(req)
 		// if req.URL == "action::stop" {
 		// 	break
 		// }
-		if ctx.Settings.RequestDelay > 0 {
+		if eng.Settings.RequestDelay > 0 {
 			worker(req)
-			time.Sleep(time.Duration(ctx.Settings.RequestDelay) * time.Millisecond)
+			time.Sleep(time.Duration(eng.Settings.RequestDelay) * time.Millisecond)
 		} else {
-			for ctx.RequestingCount >= ctx.Settings.MaxConcurrentRequests {
+			for eng.RequestingCount >= eng.Settings.MaxConcurrentRequests {
 				time.Sleep(time.Millisecond * 200)
 			}
 
@@ -159,45 +211,87 @@ func (eng *CrawlEngine) Wait() {
 
 // IsIdle 判断引擎是否进入空闲状态
 func (eng *CrawlEngine) IsIdle() bool {
-	return !eng.context.isProcessingRequests() && !eng.context.isProcessingItems()
+	return !eng.isProcessingRequests() && !eng.isProcessingItems()
 }
 
-// AddRequest 添加请求
-func (ctx *Context) AddRequest(req *Request) {
-	// fmt.Println("add: ", req)
-	ctx.RequestQueue <- req
-}
+func (eng *CrawlEngine) doRequest(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, req *http.Request) error {
 
-// AddItem 处理item
-func (ctx *Context) AddItem(item interface{}) {
-	// i :=1;
-	// fmt.Println(item)
-	ctx.ItemQueue <- item
-}
+	// defer c.wg.Done()
+	// if ctx == nil {
+	// 	ctx = NewContext()
+	// }
+	// request := &Request{
+	// 	URL:       req.URL,
+	// 	Headers:   &req.Header,
+	// 	Ctx:       ctx,
+	// 	Depth:     depth,
+	// 	Method:    method,
+	// 	Body:      requestData,
+	// 	collector: c, // 这里将Collector放到request中，这个可以对请求继续处理
+	// 	ID:        atomic.AddUint32(&c.requestCount, 1),
+	// }
+	// // 回调函数处理 request
+	// c.handleOnRequest(request)
 
-// Emit 提交Request或item
-func (ctx *Context) Emit(item interface{}) {
-	// i :=1;
-	switch item.(type) {
-	case *Request:
-		ctx.AddRequest(item.(*Request))
-		break
-	case Request:
-		request := item.(Request)
-		ctx.AddRequest(&request)
-		break
-	default:
-		ctx.AddItem(item)
-	}
+	// if request.abort {
+	// 	return nil
+	// }
 
+	// if method == "POST" && req.Header.Get("Content-Type") == "" {
+	// 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	// }
+
+	// if req.Header.Get("Accept") == "" {
+	// 	req.Header.Set("Accept", "*/*")
+	// }
+
+	// origURL := req.URL
+	// // 这里是 去请求网络， 是调用了 `http.Client.Do`方法请求的
+	// response, err := c.backend.Cache(req, c.MaxBodySize, c.CacheDir)
+	// if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
+	// 	request.ProxyURL = proxyURL
+	// }
+	// // 回调函数，处理error
+	// if err := c.handleOnError(response, err, request, ctx); err != nil {
+	// 	return err
+	// }
+	// if req.URL != origURL {
+	// 	request.URL = req.URL
+	// 	request.Headers = &req.Header
+	// }
+	// atomic.AddUint32(&c.responseCount, 1)
+	// response.Ctx = ctx
+	// response.Request = request
+
+	// err = response.fixCharset(c.DetectCharset, request.ResponseCharacterEncoding)
+	// if err != nil {
+	// 	return err
+	// }
+	// // 回调函数 处理Response
+	// c.handleOnResponse(response)
+
+	// // 回调函数 HTML
+	// err = c.handleOnHTML(response)
+	// if err != nil {
+	// 	c.handleOnError(response, err, request, ctx)
+	// }
+	// // 回调函数XML
+	// err = c.handleOnXML(response)
+	// if err != nil {
+	// 	c.handleOnError(response, err, request, ctx)
+	// }
+	// // 回调函数 Scraped
+	// c.handleOnScraped(response)
+
+	return nil
 }
 
 // isProcessingRequests 判断是否有请求正在处理, 或者还未处理
-func (ctx *Context) isProcessingRequests() bool {
-	return ctx.RequestingCount > 0 || len(ctx.RequestQueue) > 0
+func (eng *CrawlEngine) isProcessingRequests() bool {
+	return eng.RequestingCount > 0 || len(eng.RequestQueue) > 0
 }
 
 // isProcessingItems 判断是否有Item正在处理, 或者还未处理
-func (ctx *Context) isProcessingItems() bool {
-	return ctx.ProcessingItemCount > 0 || len(ctx.ItemQueue) > 0
+func (eng *CrawlEngine) isProcessingItems() bool {
+	return eng.ProcessingItemCount > 0 || len(eng.ItemQueue) > 0
 }

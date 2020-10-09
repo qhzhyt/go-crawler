@@ -91,6 +91,7 @@ func NewSelector(content []byte) *Selector {
 	// if err != nil {
 	// 	return nil, err
 	// }
+
 	node, err := html.Parse(bytes.NewReader(content))
 	if err != nil {
 		fmt.Println(err)

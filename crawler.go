@@ -1,7 +1,6 @@
 package crawler
 
 import (
-	"net/http"
 	"reflect"
 )
 
@@ -30,8 +29,8 @@ type Crawler struct {
 // NewCrawler 创建一个爬虫
 func NewCrawler(name string) *Crawler {
 	settings := DefaultSettings()
-	context := &Context{Settings: settings, RequestQueue: make(chan *Request, 100), ItemQueue: make(chan interface{}, 100)}
-	engine := &CrawlEngine{context: context, httpClient: &http.Client{}}
+	context := &Context{Settings: settings}
+	engine := newCrawlerEngine(settings)
 	context.Engine = engine
 
 	crawler := &Crawler{
