@@ -16,14 +16,15 @@ type Crawler struct {
 	StartUrls     []string
 	StartRequests func(ctx *Context) []*Request
 
-	onStop          func(ctx *Context)
-	onStart         func(ctx *Context)
-	Pipelines       []ItemPipeline
-	ItemTypeFuncs   map[string]ItemPipelineFunc
-	RequestCallback func(res *Response, ctx *Context)
-	Settings        *Settings
-	Engine          *CrawlEngine
-	context         *Context
+	onStop               func(ctx *Context)
+	onStart              func(ctx *Context)
+	Pipelines            []ItemPipeline
+	ItemTypeFuncs        map[string]ItemPipelineFunc
+	ResponseCallback     func(res *Response, ctx *Context)
+	RequestErrorCallback RequestErrorCallback
+	Settings             *Settings
+	Engine               *CrawlEngine
+	context              *Context
 }
 
 // NewCrawler 创建一个爬虫
@@ -144,7 +145,7 @@ func (c *Crawler) OnItemType(itemExample interface{}, f ItemPipelineFunc) *Crawl
 
 // WithDefaultCallback 设置默认回调函数
 func (c *Crawler) WithDefaultCallback(callback func(res *Response, ctx *Context)) *Crawler {
-	c.RequestCallback = callback
+	c.ResponseCallback = callback
 	return c
 }
 
@@ -152,4 +153,18 @@ func (c *Crawler) WithDefaultCallback(callback func(res *Response, ctx *Context)
 func (c *Crawler) WithStartRequests(callback func(ctx *Context) []*Request) *Crawler {
 	c.StartRequests = callback
 	return c
+}
+
+func (c *Crawler) OnResponse(callback ResponseCallback) *Crawler {
+	c.ResponseCallback = callback
+	return c
+}
+
+func (c *Crawler) OnRequestError(callback RequestErrorCallback) *Crawler {
+	c.RequestErrorCallback = callback
+	return c
+}
+
+func (c *Crawler) CrawlURL(url string) {
+	c.context.AddRequest(GetURL(url))
 }

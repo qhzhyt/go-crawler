@@ -2,11 +2,13 @@ package crawler
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -23,7 +25,7 @@ type CrawlEngine struct {
 	RequestingCount     int32
 	ProcessingItemCount int32
 	Settings            *Settings
-	RequestMetaMap      map[*http.Request]Meta
+	RequestMetaMap      *sync.Map //map[*http.Request]Meta
 }
 
 type itemWrapper struct {
@@ -40,10 +42,12 @@ func (eng *CrawlEngine) Start() {
 func proxyFunc(eng *CrawlEngine) func(req *http.Request) (*url.URL, error) {
 
 	return func(req *http.Request) (*url.URL, error) {
-		meta := eng.RequestMetaMap[req]
-		proxy := meta["ProxyURL"]
-		if proxy != nil && proxy.(string) != "" {
-			return url.Parse(proxy.(string))
+		meta, status := eng.RequestMetaMap.Load(req)
+		if status {
+			proxy := meta.(Meta)["ProxyURL"]
+			if proxy != nil && proxy.(string) != "" {
+				return url.Parse(proxy.(string))
+			}
 		}
 		return nil, nil
 	}
@@ -59,13 +63,13 @@ func afterRequestFunc(eng *CrawlEngine) func(req *http.Request) {
 func newCrawlerEngine(settings *Settings) *CrawlEngine {
 	eng := &CrawlEngine{
 		Settings:       settings,
-		RequestQueue:   make(chan *Request, 100),
-		ItemQueue:      make(chan *itemWrapper, 100),
-		RequestMetaMap: make(map[*http.Request]Meta),
+		RequestQueue:   make(chan *Request, 1000),
+		ItemQueue:      make(chan *itemWrapper, 1000),
+		RequestMetaMap: &sync.Map{},
 	}
 
 	httpClient := &http.Client{
-		Transport: &http.Transport{Proxy: proxyFunc(eng)},
+		Transport: &http.Transport{Proxy: proxyFunc(eng), TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
 
 	eng.httpClient = httpClient
@@ -75,7 +79,7 @@ func newCrawlerEngine(settings *Settings) *CrawlEngine {
 
 // StartProcessItems 开始处理Items
 func (eng *CrawlEngine) StartProcessItems() {
-	workerCount := int32(6)
+	workerCount := 6
 	if eng.Settings.MaxConcurrentProcessItems > 0 {
 		workerCount = eng.Settings.MaxConcurrentProcessItems
 	}
@@ -126,7 +130,7 @@ func (eng *CrawlEngine) StartProcessItems() {
 		}
 	}
 
-	for i := int32(0); i < workerCount; i++ {
+	for i := 0; i < workerCount; i++ {
 		go worker()
 	}
 }
@@ -135,7 +139,7 @@ func (eng *CrawlEngine) StartProcessItems() {
 func (eng *CrawlEngine) StartProcessRequests() {
 	// request = http.Request{Method: "GET"}
 	// request.
-	fmt.Println(eng)
+	//fmt.Println(eng)
 	worker := func(req *Request) {
 		ctx := req.context
 		atomic.AddInt32(&eng.RequestingCount, 1)
@@ -150,8 +154,9 @@ func (eng *CrawlEngine) StartProcessRequests() {
 		request := req.toHTTPRequest()
 		// runtime.SetFinalizer(request, afterRequestFunc(eng))
 		if len(req.Meta) > 0 {
-			eng.RequestMetaMap[request] = req.Meta
-			defer delete(eng.RequestMetaMap, request)
+			//eng.RequestMetaMap[request] = req.Meta
+			eng.RequestMetaMap.Store(request, req.Meta)
+			defer eng.RequestMetaMap.Delete(request)
 		}
 
 		if request == nil {
@@ -160,11 +165,27 @@ func (eng *CrawlEngine) StartProcessRequests() {
 		request.WithContext(_context)
 
 		response, err := eng.httpClient.Do(request)
-		if err != nil {
-			fmt.Println(err)
-		}
+		//if err != nil {
+		//	fmt.Println(err, response)
+		//}
 
 		if response == nil {
+			if req.Meta["retryTimes"] == nil {
+				req.Meta["retryTimes"] = 0
+			}
+
+			if req.Meta["retryTimes"].(int) < eng.Settings.MaxRetryTimes {
+				req.Meta["retryTimes"] = req.Meta["retryTimes"].(int) + 1
+				ctx.retry(req)
+			} else {
+				if req.ErrorCallback != nil {
+					req.ErrorCallback(req, err, ctx)
+				}
+				if eng.crawler.RequestErrorCallback != nil {
+					eng.crawler.RequestErrorCallback(req, err, ctx)
+				}
+			}
+
 			return
 		}
 
@@ -175,12 +196,13 @@ func (eng *CrawlEngine) StartProcessRequests() {
 		// &Response{Body: body, Status: response.Status, StatusCode: response.StatusCode, Request: req}
 		if req.Callback != nil {
 			req.Callback(res, ctx)
-		} else if eng.crawler.RequestCallback != nil {
-			eng.crawler.RequestCallback(res, ctx)
+		}
+		if eng.crawler.ResponseCallback != nil {
+			eng.crawler.ResponseCallback(res, ctx)
 		}
 	}
 	for req := range eng.RequestQueue {
-		fmt.Println(req)
+		//fmt.Println(req)
 		// if req.URL == "action::stop" {
 		// 	break
 		// }

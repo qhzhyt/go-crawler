@@ -64,3 +64,7 @@ func (ctx *Context) Emit(item interface{}) {
 	}
 
 }
+
+func (ctx *Context) retry(req *Request)  {
+	ctx.Engine.RequestQueue <- req
+}

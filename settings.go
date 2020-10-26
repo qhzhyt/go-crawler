@@ -3,9 +3,10 @@ package crawler
 // Settings 爬虫配置
 type Settings struct {
 	MaxConcurrentRequests     int32
-	RequestDelay              int32
-	RequestTimeout            int32
-	MaxConcurrentProcessItems int32
+	RequestDelay              int
+	RequestTimeout            int
+	MaxConcurrentProcessItems int
+	MaxRetryTimes             int
 }
 
 // DefaultSettings 创建默认Setting
@@ -15,5 +16,6 @@ func DefaultSettings() *Settings {
 		RequestDelay:              0,
 		RequestTimeout:            20000,
 		MaxConcurrentProcessItems: 6,
+		MaxRetryTimes: 3,
 	}
 }

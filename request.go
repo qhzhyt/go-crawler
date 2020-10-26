@@ -20,18 +20,21 @@ type Meta map[string]interface{}
 // ResponseCallback ResponseCallback
 type ResponseCallback func(res *Response, ctx *Context)
 
+type RequestErrorCallback func(req *Request, err error, ctx *Context)
+
 // Request Crawler的请求
 type Request struct {
-	Method   string
-	URL      string
-	Body     []byte
-	Headers  Headers
-	Cookies  Cookies
-	Timeout  int
-	Meta     Meta
-	Callback ResponseCallback
-	context  *Context
-	ProxyURL string
+	Method        string
+	URL           string
+	Body          []byte
+	Headers       Headers
+	Cookies       Cookies
+	Timeout       int
+	Meta          Meta
+	Callback      ResponseCallback
+	ErrorCallback RequestErrorCallback
+	context       *Context
+	ProxyURL      string
 }
 
 // Args is http post form
@@ -163,6 +166,11 @@ func (req *Request) OnResponse(callback ResponseCallback) *Request {
 	return req
 }
 
+func (req *Request) OnError(callback RequestErrorCallback) *Request {
+	req.ErrorCallback = callback
+	return req
+}
+
 // Get a header value by name
 func (h Headers) Get(name string) string {
 	values := h[name]
@@ -182,4 +190,17 @@ func (h Headers) Get(name string) string {
 // Set a header value by name
 func (h Headers) Set(name string, value string) {
 	h[name] = value
+}
+
+func (h Headers) GetList(name string) []string {
+	values := h[name]
+	switch values.(type) {
+	case string:
+		return []string{values.(string)}
+	case []string:
+
+		return values.([]string)
+
+	}
+	return []string{}
 }
