@@ -1,31 +1,34 @@
 package crawler
 
 import (
-	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // CrawlEngine 爬取引擎
 type CrawlEngine struct {
 	// context             *Context
-	crawler             *Crawler
-	cookieJar           *http.CookieJar
-	visitedUrls         map[string]bool
-	httpClient          *http.Client
-	RequestQueue        chan *Request
-	ItemQueue           chan *itemWrapper
-	RequestingCount     int32
-	ProcessingItemCount int32
-	Settings            *Settings
-	RequestMetaMap      *sync.Map //map[*http.Request]Meta
+	crawler     *Crawler
+	cookieJar   *http.CookieJar
+	visitedUrls map[string]bool
+	httpClient  *http.Client
+	//fastHttpClient *fasthttp.Client
+	RequestQueue chan *Request
+	ItemQueue    chan *itemWrapper
+	//RequestingCount     int32
+	//ProcessingItemCount int32
+	Settings           *Settings
+	RequestMetaMap     *sync.Map //map[*http.Request]Meta
+	requestingChan     chan *Request
+	processingItemChan chan bool
 }
 
 type itemWrapper struct {
@@ -35,6 +38,8 @@ type itemWrapper struct {
 
 // Start 启动引擎
 func (eng *CrawlEngine) Start() {
+	eng.requestingChan = make(chan *Request, eng.Settings.MaxConcurrentRequests)
+	eng.processingItemChan = make(chan bool, eng.Settings.MaxConcurrentProcessItems)
 	go eng.StartProcessRequests()
 	go eng.StartProcessItems()
 }
@@ -53,26 +58,66 @@ func proxyFunc(eng *CrawlEngine) func(req *http.Request) (*url.URL, error) {
 	}
 }
 
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 func afterRequestFunc(eng *CrawlEngine) func(req *http.Request) {
 	return func(req *http.Request) {
 		fmt.Println(eng.RequestMetaMap)
 	}
 }
 
+func creatHttpClient(transport *http.Transport, engine *CrawlEngine) *http.Client {
+	if transport == nil {
+		transport = &http.Transport{
+			ResponseHeaderTimeout: 20 * time.Second,
+			IdleConnTimeout:       20 * time.Second,
+			TLSHandshakeTimeout:   20 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout: 20 * time.Second,
+			}).DialContext,
+		}
+	}
+
+	transport.MaxIdleConnsPerHost = 1
+	transport.DisableKeepAlives = true
+	transport.MaxIdleConns = 1
+	transport.Proxy = proxyFunc(engine)
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: engine.Settings.SkipTLSVerify}
+
+	if transport.ResponseHeaderTimeout == 0 {
+		transport.ResponseHeaderTimeout = 20 * time.Second
+	}
+	if transport.IdleConnTimeout == 0 {
+		transport.IdleConnTimeout = 20 * time.Second
+	}
+	if transport.TLSHandshakeTimeout == 0 {
+		transport.TLSHandshakeTimeout = 20 * time.Second
+	}
+
+	return &http.Client{
+		CheckRedirect: checkRedirect,
+		Transport:     transport,
+		Timeout:       time.Second * 60,
+	}
+
+}
+
 // NewCrawlerEngine NewCrawlerEngine
 func newCrawlerEngine(settings *Settings) *CrawlEngine {
+	fmt.Println(settings)
 	eng := &CrawlEngine{
-		Settings:       settings,
-		RequestQueue:   make(chan *Request, 1000),
-		ItemQueue:      make(chan *itemWrapper, 1000),
+		Settings:     settings,
+		RequestQueue: make(chan *Request, settings.MaxConcurrentRequests*3),
+		ItemQueue:    make(chan *itemWrapper, 1000),
+		//requestingChan: make(chan *Request, settings.MaxConcurrentRequests),
 		RequestMetaMap: &sync.Map{},
 	}
 
-	httpClient := &http.Client{
-		Transport: &http.Transport{Proxy: proxyFunc(eng), TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-	}
+	eng.httpClient = creatHttpClient(settings.Transport, eng)
 
-	eng.httpClient = httpClient
+	//eng.fastHttpClient = &fasthttp.D
 
 	return eng
 }
@@ -86,16 +131,17 @@ func (eng *CrawlEngine) StartProcessItems() {
 
 	worker := func() {
 		hasInc := false
+
 		defer func() {
 			if hasInc {
-				atomic.AddInt32(&eng.ProcessingItemCount, -1)
+				<-eng.processingItemChan
 			}
 		}()
 
 		for itemW := range eng.ItemQueue {
 			item := itemW.item
 			ctx := itemW.context
-			atomic.AddInt32(&eng.ProcessingItemCount, 1)
+			eng.processingItemChan <- true
 			hasInc = true
 
 			/* pipeline 执行顺序
@@ -125,7 +171,8 @@ func (eng *CrawlEngine) StartProcessItems() {
 					}
 				}
 			}
-			atomic.AddInt32(&eng.ProcessingItemCount, -1)
+			<-eng.processingItemChan
+			//atomic.AddInt32(&eng.ProcessingItemCount, -1)
 			hasInc = false
 		}
 	}
@@ -135,87 +182,128 @@ func (eng *CrawlEngine) StartProcessItems() {
 	}
 }
 
+func (eng *CrawlEngine) processResponseCallback(req *Request, res *Response) {
+	req.context.LastResponse = res
+	// &Response{Body: body, Status: response.Status, StatusCode: response.StatusCode, Request: req}
+	if req.Callback != nil {
+		req.Callback(res, req.context)
+	}
+	if eng.crawler.responseCallback != nil {
+		eng.crawler.responseCallback(res, req.context)
+	}
+}
+
+func (eng CrawlEngine) processRequestErrorCallback(req *Request, err error) {
+	if req.ErrorCallback != nil {
+		req.ErrorCallback(req, err, req.context)
+	}
+	if eng.crawler.requestErrorCallback != nil {
+		eng.crawler.requestErrorCallback(req, err, req.context)
+	}
+}
+
 // StartProcessRequests 开始处理请求
 func (eng *CrawlEngine) StartProcessRequests() {
-	// request = http.Request{Method: "GET"}
-	// request.
-	//fmt.Println(eng)
-	worker := func(req *Request) {
-		ctx := req.context
-		atomic.AddInt32(&eng.RequestingCount, 1)
-		defer atomic.AddInt32(&eng.RequestingCount, -1)
 
-		timeout := time.Duration(20 * time.Microsecond)
-		if req.Timeout != 0 {
-			timeout = time.Duration(req.Timeout) * time.Microsecond
-		}
-		_context, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		request := req.toHTTPRequest()
+	worker := func(req *Request) *Request {
+		defer func() {
+			<-eng.requestingChan
+		}()
+		ctx := req.context
+		//atomic.AddInt32(&eng.RequestingCount, 1)
+		//defer atomic.AddInt32(&eng.RequestingCount, -1)
+
+		//timeout := 20 * time.Microsecond
+		//if req.Timeout != 0 {
+		//	timeout = time.Duration(req.Timeout) * time.Microsecond
+		//}
+		//_context, cancel := context.WithTimeout(context.Background(), timeout)
+		//defer cancel()
+		request, err := req.toHTTPRequest()
 		// runtime.SetFinalizer(request, afterRequestFunc(eng))
+
+		if request == nil {
+			fmt.Println("request is nil")
+			eng.processRequestErrorCallback(req, err)
+			return req
+		}
+
 		if len(req.Meta) > 0 {
 			//eng.RequestMetaMap[request] = req.Meta
 			eng.RequestMetaMap.Store(request, req.Meta)
 			defer eng.RequestMetaMap.Delete(request)
 		}
-
-		if request == nil {
-			fmt.Println("request is nil")
-		}
-		request.WithContext(_context)
+		//request.WithContext(_context)
 
 		response, err := eng.httpClient.Do(request)
-		//if err != nil {
-		//	fmt.Println(err, response)
-		//}
 
 		if response == nil {
-			if req.Meta["retryTimes"] == nil {
-				req.Meta["retryTimes"] = 0
-			}
+			//if req == nil {
+			//	req.Meta["retryTimes"] = 0
+			//}
 
-			if req.Meta["retryTimes"].(int) < eng.Settings.MaxRetryTimes {
-				req.Meta["retryTimes"] = req.Meta["retryTimes"].(int) + 1
-				ctx.retry(req)
+			if req.retryTimes < eng.Settings.MaxRetryTimes {
+				req.retryTimes++
+				go ctx.retry(req)
 			} else {
-				if req.ErrorCallback != nil {
-					req.ErrorCallback(req, err, ctx)
-				}
-				if eng.crawler.RequestErrorCallback != nil {
-					eng.crawler.RequestErrorCallback(req, err, ctx)
-				}
+				eng.processRequestErrorCallback(req, err)
 			}
+			//return
+		} else {
+			// response.Header
 
-			return
+			res := NewResponse(response).WithRequest(req)
+
+			//fmt.Println(res.StatusCode)
+
+			if res.StatusCode == 301 || res.StatusCode == 302 || res.StatusCode == 303 || res.StatusCode == 307 {
+				//	处理重定向
+				redirectUrl := res.Headers.Get("Location")
+
+				newReq := res.Redirect(redirectUrl)
+
+				if newReq.redirectTimes > eng.Settings.MaxRedirectTimes {
+					eng.processRequestErrorCallback(req, errors.New(fmt.Sprintf("redirect too many times: %d", newReq.redirectTimes)))
+				} else {
+					if eng.crawler.redirectCallback != nil {
+						//newReq := res.Redirect()
+						result := eng.crawler.redirectCallback(res, newReq, ctx)
+
+						if result != nil {
+							eng.RequestQueue <- result
+						} else {
+							//eng.processResponseCallback(req, res)
+						}
+					} else {
+						//redirectUrl := res.Headers.Get("Location")
+						eng.RequestQueue <- newReq
+					}
+				}
+
+			} else {
+				eng.processResponseCallback(req, res)
+			}
 		}
 
-		// response.Header
-		res := NewResponse(response).WithRequest(req)
+		//fmt.Println(len(eng.requestingChan))
 
-		ctx.LastResponse = res
-		// &Response{Body: body, Status: response.Status, StatusCode: response.StatusCode, Request: req}
-		if req.Callback != nil {
-			req.Callback(res, ctx)
-		}
-		if eng.crawler.ResponseCallback != nil {
-			eng.crawler.ResponseCallback(res, ctx)
-		}
+		return req
 	}
 	for req := range eng.RequestQueue {
 		//fmt.Println(req)
 		// if req.URL == "action::stop" {
 		// 	break
-		// }
+		//}
+		//fmt.Println(req)
 		if eng.Settings.RequestDelay > 0 {
 			worker(req)
 			time.Sleep(time.Duration(eng.Settings.RequestDelay) * time.Millisecond)
 		} else {
-			for eng.RequestingCount >= eng.Settings.MaxConcurrentRequests {
-				time.Sleep(time.Millisecond * 200)
-			}
-
+			//for eng.RequestingCount >= eng.Settings.MaxConcurrentRequests {
+			//	time.Sleep(time.Millisecond * 200)
+			//}
+			eng.requestingChan <- req
 			go worker(req)
-
 		}
 	}
 
@@ -225,9 +313,19 @@ func (eng *CrawlEngine) StartProcessRequests() {
 // Wait 等待引擎执行结束
 func (eng *CrawlEngine) Wait() {
 	// ctx := eng.context
-	interval := time.Millisecond * 200
+	interval := time.Millisecond * 1000
 	for !(eng.IsIdle()) {
 		time.Sleep(interval)
+	}
+}
+
+// Wait 等待引擎执行结束
+func (eng *CrawlEngine) WaitTime(seconds time.Duration) {
+	// ctx := eng.context
+	interval := time.Millisecond * 1000
+	for !(eng.IsIdle()) && seconds > 0 {
+		time.Sleep(interval)
+		seconds--
 	}
 }
 
@@ -310,10 +408,10 @@ func (eng *CrawlEngine) doRequest(u, method string, depth int, requestData io.Re
 
 // isProcessingRequests 判断是否有请求正在处理, 或者还未处理
 func (eng *CrawlEngine) isProcessingRequests() bool {
-	return eng.RequestingCount > 0 || len(eng.RequestQueue) > 0
+	return len(eng.requestingChan) > 0 || len(eng.RequestQueue) > 0
 }
 
 // isProcessingItems 判断是否有Item正在处理, 或者还未处理
 func (eng *CrawlEngine) isProcessingItems() bool {
-	return eng.ProcessingItemCount > 0 || len(eng.ItemQueue) > 0
+	return len(eng.processingItemChan) > 0 || len(eng.ItemQueue) > 0
 }

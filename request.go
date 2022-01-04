@@ -22,12 +22,14 @@ type ResponseCallback func(res *Response, ctx *Context)
 
 type RequestErrorCallback func(req *Request, err error, ctx *Context)
 
+type RedirectCallback func(res *Response, req *Request, ctx *Context) *Request
+
 // Request Crawler的请求
 type Request struct {
 	Method        string
 	URL           string
 	Body          []byte
-	Headers       Headers
+	Headers       http.Header
 	Cookies       Cookies
 	Timeout       int
 	Meta          Meta
@@ -35,12 +37,17 @@ type Request struct {
 	ErrorCallback RequestErrorCallback
 	context       *Context
 	ProxyURL      string
+	OriginURL     string
+	Host          string
+	History       History
+	retryTimes    int
+	redirectTimes int
 }
 
 // Args is http post form
 type Args url.Values
 
-func (req *Request) toHTTPRequest() *http.Request {
+func (req *Request) toHTTPRequest() (*http.Request, error) {
 	// url, _ := urlLib.Parse(req.URL)
 	// rc, ok := body.(io.ReadCloser)
 	// if !ok && body != nil {
@@ -48,21 +55,23 @@ func (req *Request) toHTTPRequest() *http.Request {
 	// }
 	result, err := http.NewRequest(req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
-		return nil
+		// log.Println(err)
+		return nil, err
 	}
-	for k, v := range req.Headers {
-		if v != nil {
-			switch v.(type) {
-			case string:
-				result.Header.Set(k, v.(string))
-			case []string:
-				values := v.([]string)
-				if values != nil && len(values) > 0 {
-					result.Header.Set(k, values[0])
-				}
-			}
-		}
-	}
+	//for k, v := range req.Headers {
+	//	if v != nil {
+	//		switch v.(type) {
+	//		case string:
+	//			result.Header.Set(k, v.(string))
+	//		case []string:
+	//			values := v.([]string)
+	//			if values != nil && len(values) > 0 {
+	//				result.Header.Set(k, values[0])
+	//			}
+	//		}
+	//	}
+	//}
+	result.Header = req.Headers
 
 	for k, v := range req.Cookies {
 		if v != "" {
@@ -74,12 +83,16 @@ func (req *Request) toHTTPRequest() *http.Request {
 		req.Meta["ProxyURL"] = req.ProxyURL
 	}
 
-	return result
+	if req.Host != "" {
+		result.Host = req.Host
+	}
+
+	return result, nil
 }
 
 // NewRequest NewRequest
 func NewRequest(method string, url string, body []byte) *Request {
-	return &Request{Method: method, URL: url, Body: body, Headers: make(Headers), Cookies: make(Cookies), Meta: make(Meta)}
+	return &Request{Method: method, URL: url, Body: body, Headers: make(http.Header), Cookies: make(Cookies), Meta: make(Meta), OriginURL: url}
 }
 
 // GetRequest GetRequest
@@ -113,8 +126,8 @@ func GetURLs(urls ...string) []*Request {
 
 	result := make([]*Request, len(urls))
 
-	for i, url := range urls {
-		result[i] = GetURL(url)
+	for i, url0 := range urls {
+		result[i] = GetURL(url0)
 	}
 
 	return result
@@ -122,7 +135,7 @@ func GetURLs(urls ...string) []*Request {
 
 // WithContentType set Content-Type
 func (req *Request) WithContentType(contentType string) *Request {
-	req.Headers["Content-Type"] = contentType
+	req.Headers.Set("Content-Type", contentType)
 	return req
 }
 
@@ -135,8 +148,14 @@ func (req *Request) WithTimeout(timeout int) *Request {
 // WithHeaders set Headers
 func (req *Request) WithHeaders(headers map[string]string) *Request {
 	for k, v := range headers {
-		req.Headers[k] = v
+		req.Headers.Set(k, v)
 	}
+	return req
+}
+
+// WithHeaders set Headers
+func (req *Request) AddHeader(key string, value string) *Request {
+	req.Headers.Add(key, value)
 	return req
 }
 
@@ -146,9 +165,23 @@ func (req *Request) WithMeta(meta Meta) *Request {
 	return req
 }
 
+// AddMeta set Headers
+func (req *Request) AddMeta(key string, value interface{}) *Request {
+	if req.Meta != nil {
+		req.Meta[key] = value
+	}
+	return req
+}
+
 // WithProxy set Headers
 func (req *Request) WithProxy(proxy string) *Request {
 	req.ProxyURL = proxy
+	return req
+}
+
+// WithHost set Host
+func (req *Request) WithHost(host string) *Request {
+	req.Host = host
 	return req
 }
 
@@ -171,36 +204,58 @@ func (req *Request) OnError(callback RequestErrorCallback) *Request {
 	return req
 }
 
-// Get a header value by name
-func (h Headers) Get(name string) string {
-	values := h[name]
-	switch values.(type) {
-	case string:
-		return values.(string)
-	case []string:
-
-		vs := values.([]string)
-		if vs != nil && len(vs) > 0 {
-			return vs[0]
-		}
+func (req *Request) Clone() *Request {
+	return &Request{
+		Method:        req.Method,
+		URL:           req.URL,
+		Headers:       req.Headers,
+		Cookies:       req.Cookies,
+		Body:          req.Body,
+		Timeout:       req.Timeout,
+		Callback:      req.Callback,
+		ErrorCallback: req.ErrorCallback,
+		Meta:          req.Meta,
+		ProxyURL:      req.ProxyURL,
+		OriginURL:     req.OriginURL,
+		context:       req.context,
+		redirectTimes: req.redirectTimes,
 	}
-	return ""
 }
 
-// Set a header value by name
-func (h Headers) Set(name string, value string) {
-	h[name] = value
+func (m Meta) Has(key string) bool {
+	return m[key] != nil
 }
 
-func (h Headers) GetList(name string) []string {
-	values := h[name]
-	switch values.(type) {
-	case string:
-		return []string{values.(string)}
-	case []string:
-
-		return values.([]string)
-
-	}
-	return []string{}
-}
+//// Get a header value by name
+//func (h Headers) Get(name string) string {
+//	values := h[name]
+//	switch values.(type) {
+//	case string:
+//		return values.(string)
+//	case []string:
+//
+//		vs := values.([]string)
+//		if vs != nil && len(vs) > 0 {
+//			return vs[0]
+//		}
+//	}
+//	return ""
+//}
+//
+//// Set a header value by name
+//func (h Headers) Set(name string, value string) {
+//	h[name] = value
+//}
+//
+//func (h Headers) GetList(name string) []string {
+//	values := h[name]
+//	switch values.(type) {
+//	case string:
+//		return []string{values.(string)}
+//	case []string:
+//
+//		return values.([]string)
+//
+//	}
+//	return []string{}
+//}
