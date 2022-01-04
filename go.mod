@@ -8,4 +8,4 @@ require (
 	golang.org/x/net v0.0.0-20201006153459-a7d1128ccaa0
 )
 
-# replace github.com/qhzhyt/go-crawler => ./
+// replace github.com/qhzhyt/go-crawler => ./
